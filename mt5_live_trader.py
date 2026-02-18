@@ -1,0 +1,533 @@
+# -*- coding: utf-8 -*-
+import time
+import json
+import os
+import math
+import logging
+
+import pandas as pd
+import MetaTrader5 as mt5
+
+import strategy_backtest as st  # <-- دست نزن
+
+
+# ================== تنظیمات ==================
+SYMBOLS = ["EURJPY", "EURCAD", "GBPJPY", "CHFJPY", "XAUUSD" , "EURUSD"]
+
+MAGIC = 123456
+RR_TP = 3.0
+RR_CANCEL = 4.0
+
+CHECK_CANCEL_SEC = 300
+POLL_SEC = 5
+
+MAX_ORDERS_PER_SYMBOL = 3
+MAX_OPEN_POS = 3
+
+ENTRY_OFF = 0.10
+SL_OFF = 0.25
+RESERVE = 0.15
+RISK_PER_TRADE = 0.01
+
+DRY_RUN = True     # اول True؛ بعد از تست False کن
+STATE_FILE = "live_state.json"
+MT5_TERMINAL_PATH = None
+
+
+# Lookback: لازم نیست «۳ سال» باشد؛ ولی باید به اندازه‌ای باشد که:
+# - ATR(14) و range_filter(20) و swing/trend درست warmup شوند
+# - زون‌ها تعداد کافی داشته باشند
+H4_BARS = 2500
+D1_BARS = 1200
+W1_BARS = 400
+
+
+# ================== لاگ ==================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+def log_info(msg): logging.info(msg)
+def log_warn(msg): logging.warning(msg)
+def log_err(msg):  logging.error(msg)
+
+
+# ================== State ==================
+def load_state():
+    if os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log_warn(f"STATE load failed, recreating. reason={e}")
+    return {"last_h4_time": {}, "placed_zoneids": []}
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ================== اتصال MT5 ==================
+def connect():
+    ok = mt5.initialize(path=MT5_TERMINAL_PATH) if MT5_TERMINAL_PATH else mt5.initialize()
+    if not ok:
+        code, msg = mt5.last_error()
+        raise RuntimeError(f"MT5 initialize failed | code={code} msg={msg}")
+
+    term = mt5.terminal_info()
+    acc = mt5.account_info()
+
+    log_info(f"MT5 initialized | name={getattr(term,'name',None)} build={getattr(term,'build',None)}")
+
+    if acc:
+        log_info(
+            f"Account connected | login={acc.login} name={acc.name} server={acc.server} "
+            f"balance={acc.balance} equity={acc.equity} currency={acc.currency}"
+        )
+        log_info(f"Trade allowed? terminal={term.trade_allowed if term else None} account={acc.trade_allowed}")
+    else:
+        log_warn("account_info() is None (احتمالاً داخل MT5 لاگین نیستی)")
+
+def shutdown():
+    mt5.shutdown()
+    log_info("MT5 shutdown")
+
+
+# ================== ابزار دیتا ==================
+def rates_to_df(rates):
+    if rates is None or len(rates) == 0:
+        return pd.DataFrame()
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    return df[["time", "open", "high", "low", "close"]].copy()
+
+def ensure_symbol(symbol):
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        code, msg = mt5.last_error()
+        log_warn(f"{symbol} symbol_info=None | code={code} msg={msg}")
+        return False
+
+    if not info.visible:
+        if not mt5.symbol_select(symbol, True):
+            code, msg = mt5.last_error()
+            log_warn(f"{symbol} symbol_select failed | code={code} msg={msg}")
+            return False
+
+    if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+        log_warn(f"{symbol} trade_mode=DISABLED")
+        return False
+
+    return True
+
+def get_closed_bars(symbol, timeframe, n):
+    if not ensure_symbol(symbol):
+        return pd.DataFrame()
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, int(n))  # pos=1 => کندل بسته
+    return rates_to_df(rates)
+
+def get_spread_now(symbol):
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+    return float(tick.ask - tick.bid)
+
+def get_last_closed_time(symbol, timeframe):
+    df = get_closed_bars(symbol, timeframe, 1)
+    if df.empty:
+        return None
+    return pd.to_datetime(df["time"].iloc[-1])
+
+def pending_orders(symbol):
+    od = mt5.orders_get(symbol=symbol)
+    return list(od) if od else []
+
+def positions(symbol=None):
+    ps = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    return list(ps) if ps else []
+
+
+# ================== ترید/کنسل ==================
+def cancel_order(ticket):
+    req = {"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)}
+    if DRY_RUN:
+        log_info(f"DRY_RUN cancel -> {req}")
+        return None
+    res = mt5.order_send(req)
+    log_info(f"cancel result -> {res}")
+    return res
+
+def calc_volume_by_risk(symbol, entry_price, sl_price, risk_pct, reserve_pct):
+    acc = mt5.account_info()
+    info = mt5.symbol_info(symbol)
+    if acc is None or info is None:
+        return 0.01
+
+    equity = float(acc.equity)
+    usable = equity * (1.0 - float(reserve_pct))
+    risk_money = usable * float(risk_pct)
+
+    tick_value = float(info.trade_tick_value)
+    tick_size = float(info.trade_tick_size)
+    if tick_value <= 0 or tick_size <= 0:
+        return float(info.volume_min)
+
+    price_dist = abs(float(entry_price) - float(sl_price))
+    ticks = price_dist / tick_size
+    risk_per_lot = ticks * tick_value
+    if risk_per_lot <= 0:
+        return float(info.volume_min)
+
+    vol = risk_money / risk_per_lot
+
+    step = float(info.volume_step)
+    vmin = float(info.volume_min)
+    vmax = float(info.volume_max)
+
+    vol = max(vmin, min(vmax, vol))
+    vol = math.floor(vol / step) * step
+    return round(float(vol), 6)
+
+def place_limit(symbol, direction, volume, entry_price, sl_price, tp_price, comment):
+    otype = mt5.ORDER_TYPE_BUY_LIMIT if direction == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
+
+    req = {
+        "action": mt5.TRADE_ACTION_PENDING,
+        "symbol": symbol,
+        "volume": float(volume),
+        "type": int(otype),
+        "price": float(entry_price),
+        "sl": float(sl_price),
+        "tp": float(tp_price),
+        "deviation": 20,
+        "magic": int(MAGIC),
+        "comment": str(comment),
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_RETURN,
+    }
+
+    if DRY_RUN:
+        log_info(f"DRY_RUN place -> {req}")
+        return None
+
+    res = mt5.order_send(req)
+    log_info(f"place result -> {res}")
+    return res
+
+
+# ================== قیمت‌سازی (سازگارتر با bid/ask) ==================
+def make_mt5_prices_from_zone(direction, proximal, distal, spread):
+    """
+    فرض: OHLCهایی که از MT5 می‌گیریم معمولاً Bid هستند.
+    BUY: ورود با Ask انجام می‌شود => order price = entry_bid + spread
+         SL/TP برای پوزیشن BUY با Bid تریگر می‌شوند => sl,tp را bid-level می‌گذاریم
+    SELL: ورود با Bid انجام می‌شود => order price = entry_bid
+          SL/TP برای پوزیشن SELL با Ask تریگر می‌شوند => sl,tp را ask-level می‌گذاریم
+    """
+    height = max(1e-9, float(max(proximal, distal) - min(proximal, distal)))
+    sp = float(max(0.0, spread))
+
+    if direction == "BUY":
+        entry_bid = float(proximal - ENTRY_OFF * height)
+        sl_bid    = float(distal  - SL_OFF    * height)
+
+        open_ask = entry_bid + sp
+        risk = open_ask - sl_bid
+        tp_bid = open_ask + RR_TP * risk
+
+        order_price = open_ask   # BUY_LIMIT triggers on Ask
+        sl_price = sl_bid        # triggers on Bid
+        tp_price = tp_bid        # triggers on Bid
+        return order_price, sl_price, tp_price, risk
+
+    else:  # SELL
+        entry_bid = float(proximal + ENTRY_OFF * height)
+        sl_bid    = float(distal  + SL_OFF    * height)
+
+        sl_ask = sl_bid + sp
+        risk = sl_ask - entry_bid
+        tp_ask = entry_bid - RR_TP * risk
+
+        order_price = entry_bid  # SELL_LIMIT triggers on Bid
+        sl_price = sl_ask        # triggers on Ask
+        tp_price = tp_ask        # triggers on Ask
+        return order_price, sl_price, tp_price, risk
+
+
+# ================== ساخت کاندیدها از دیتای MT5 (همان منطق فعلی خودت) ==================
+def find_active_pending_candidates(symbol, spread):
+    h4 = get_closed_bars(symbol, mt5.TIMEFRAME_H4, H4_BARS)
+    d1 = get_closed_bars(symbol, mt5.TIMEFRAME_D1, D1_BARS)
+    w1 = get_closed_bars(symbol, mt5.TIMEFRAME_W1, W1_BARS)
+
+    if h4.empty or d1.empty or w1.empty:
+        log_warn(f"{symbol} not enough data | h4={len(h4)} d1={len(d1)} w1={len(w1)}")
+        return []
+
+    for df in (h4, d1, w1):
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"]  = df["low"].astype(float)
+        df["close"]= df["close"].astype(float)
+
+    h4["atr"] = st.atr(h4); d1["atr"] = st.atr(d1); w1["atr"] = st.atr(w1)
+    h4["range"] = st.range_filter(h4, h4["atr"])
+    d1["range"] = st.range_filter(d1, d1["atr"])
+    h4["trend"] = st.trend_from_swings(h4, n=1)
+    d1["trend"] = st.trend_from_swings(d1, n=1)
+
+    w_z = st.dedup_zones(st.build_zones(w1, symbol, "W1", 12, w1["atr"]))
+    h_z = st.dedup_zones(st.build_zones(h4, symbol, "H4", 6,  h4["atr"]))
+
+    h_z = sorted(h_z, key=lambda z: z.created_time)
+    for idx, z in enumerate(h_z, start=1):
+        z.zone_id = f"{symbol}_H4_{idx:05d}"
+
+    d_times = d1["time"].values
+    import numpy as np
+    def last_idx_leq(times, t):
+        return np.searchsorted(times, t, side="right") - 1
+
+    pending = []
+    used = set()
+
+    for i in range(len(h4)):
+        t = h4["time"].iloc[i]
+        o = float(h4["open"].iloc[i])
+        h = float(h4["high"].iloc[i])
+        l = float(h4["low"].iloc[i])
+        c = float(h4["close"].iloc[i])
+
+        di = last_idx_leq(d_times, t.to_datetime64())
+        if di < 0:
+            continue
+
+        dtr = int(d1["trend"].iloc[di])
+        htr = int(h4["trend"].iloc[i])
+        drg = bool(d1["range"].iloc[di]) if not pd.isna(d1["range"].iloc[di]) else False
+        hrg = bool(h4["range"].iloc[i]) if not pd.isna(h4["range"].iloc[i]) else False
+
+        # touches + expiry
+        for z in h_z:
+            if z.created_time > t or z.expired:
+                continue
+
+            touched = (h >= z.low() and l <= z.high())
+            if touched:
+                if z.touch_count == 0:
+                    z.touch_count = 1; z.last_touch_i = i; z.clean_after_touch = 0
+                else:
+                    if z.clean_after_touch >= 3 and z.last_touch_i is not None and (i - z.last_touch_i) <= 50:
+                        z.touch_count += 1; z.last_touch_i = i; z.clean_after_touch = 0
+                    else:
+                        z.clean_after_touch = 0
+            else:
+                if z.touch_count > 0:
+                    z.clean_after_touch += 1
+
+            if z.touch_count == 1 and z.last_touch_i is not None and (i - z.last_touch_i) > 50:
+                z.expired = True
+
+        # place orders
+        for z in h_z:
+            if z.created_time > t or z.expired or id(z) in used:
+                continue
+            if z.touch_count >= 3:
+                used.add(id(z)); continue
+            if z.touch_count == 0:
+                continue
+            if drg or hrg:
+                used.add(id(z)); continue
+            if dtr == 0 or htr == 0 or dtr != htr:
+                used.add(id(z)); continue
+            if len([p for p in pending if p["active"] and (not p["filled"])]) >= MAX_ORDERS_PER_SYMBOL:
+                used.add(id(z)); continue
+
+            order_price, sl_price, tp_price, risk = make_mt5_prices_from_zone(
+                z.direction, z.proximal, z.distal, spread
+            )
+            if risk <= 0:
+                used.add(id(z)); continue
+
+            pending.append({
+                "zone_id": z.zone_id,
+                "direction": z.direction,
+                "price": order_price,
+                "sl": sl_price,
+                "tp": tp_price,
+                "risk": risk,
+                "placed_time": t,
+                "active": True,
+                "filled": False,
+                "o": o, "c": c, "h": h, "l": l,
+            })
+            used.add(id(z))
+
+        # weekly cancel BEFORE fill (بدنه)
+        wz_now = [wz for wz in w_z if wz.created_time <= t]
+        for p in pending:
+            if not p["active"] or p["filled"]:
+                continue
+            opp_dir = "SELL" if p["direction"] == "BUY" else "BUY"
+            opp = [wz for wz in wz_now if wz.direction == opp_dir]
+            if any(st.body_overlaps_zone(o, c, wz) for wz in opp):
+                p["active"] = False
+
+        # RR4 cancel (قانون جدید روی تاریخچه)
+        for p in pending:
+            if not p["active"] or p["filled"]:
+                continue
+            # روی bid-history این تقریبی است؛ برای لایو کنسل واقعی را جداگانه مدیریت می‌کنیم
+            if p["direction"] == "BUY":
+                # اگر قیمت خیلی بالا رفت دیگر سفارش را نمی‌خواهیم
+                if h >= (p["price"] + RR_CANCEL * p["risk"]):
+                    p["active"] = False
+            else:
+                if l <= (p["price"] - RR_CANCEL * p["risk"]):
+                    p["active"] = False
+
+        # اگر در گذشته فیل می‌شد، الان نباید فعال باشد
+        for p in pending:
+            if not p["active"] or p["filled"]:
+                continue
+            if p["direction"] == "BUY":
+                # BUY_LIMIT triggers on Ask; روی bid-history دقیق نیست، ولی به‌عنوان فیلتر کفایت می‌کند
+                if l <= (p["price"] - float(spread)):
+                    p["filled"] = True; p["active"] = False
+            else:
+                if h >= p["price"]:
+                    p["filled"] = True; p["active"] = False
+
+    alive = [p for p in pending if p["active"] and (not p["filled"])]
+    return alive
+
+
+# ================== کنسل RR4 روی سفارش‌های واقعی ==================
+def manage_cancel_rr4(symbol):
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return
+
+    cur_bid = float(tick.bid)
+    cur_ask = float(tick.ask)
+
+    for o in pending_orders(symbol):
+        if int(o.magic) != int(MAGIC):
+            continue
+        if o.type not in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT):
+            continue
+        if o.sl is None or float(o.sl) == 0.0:
+            continue
+
+        entry = float(o.price_open)
+        sl = float(o.sl)
+        risk = abs(entry - sl)
+        if risk <= 0:
+            continue
+
+        if o.type == mt5.ORDER_TYPE_BUY_LIMIT:
+            if cur_bid >= (entry + RR_CANCEL * risk):
+                log_info(f"{symbol} RR4 cancel BUY_LIMIT | ticket={o.ticket}")
+                cancel_order(o.ticket)
+
+        elif o.type == mt5.ORDER_TYPE_SELL_LIMIT:
+            if cur_ask <= (entry - RR_CANCEL * risk):
+                log_info(f"{symbol} RR4 cancel SELL_LIMIT | ticket={o.ticket}")
+                cancel_order(o.ticket)
+
+
+def reconcile_orders_with_candidates(symbol, alive_candidates):
+    """
+    سفارش‌های pending ما (MAGIC) که دیگر در لیست alive نیستند را کنسل می‌کنیم.
+    معیار: comment == zone_id
+    """
+    desired = set([p["zone_id"] for p in alive_candidates])
+
+    for o in pending_orders(symbol):
+        if int(o.magic) != int(MAGIC):
+            continue
+        if o.type not in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT):
+            continue
+
+        zid = str(o.comment).strip() if o.comment is not None else ""
+        if zid and zid not in desired:
+            log_info(f"{symbol} cancel stale order (not alive anymore) | ticket={o.ticket} comment={zid}")
+            cancel_order(o.ticket)
+
+
+# ================== MAIN ==================
+def main():
+    connect()
+    state = load_state()
+    log_info("Watching symbols: " + ", ".join(SYMBOLS))
+
+    last_cancel_check = 0
+
+    try:
+        while True:
+            now = time.time()
+
+            # 1) هر 5 دقیقه: RR4 cancel روی سفارش‌های واقعی
+            if now - last_cancel_check >= CHECK_CANCEL_SEC:
+                for sym in SYMBOLS:
+                    manage_cancel_rr4(sym)
+                last_cancel_check = now
+
+            # 2) فقط وقتی کندل H4 جدید بسته شد: محاسبه و اعمال
+            for sym in SYMBOLS:
+                t_h4 = get_last_closed_time(sym, mt5.TIMEFRAME_H4)
+                if t_h4 is None:
+                    continue
+
+                last_done = state["last_h4_time"].get(sym)
+                t_key = t_h4.isoformat()
+                if last_done == t_key:
+                    continue
+
+                state["last_h4_time"][sym] = t_key
+                save_state(state)
+
+                # محدودیت پوزیشن باز کل
+                if len(positions()) >= MAX_OPEN_POS:
+                    log_info(f"{sym} skip: max open positions reached")
+                    continue
+
+                spread = get_spread_now(sym)
+                if spread is None:
+                    log_warn(f"{sym} skip: no spread/tick")
+                    continue
+
+                alive = find_active_pending_candidates(sym, spread=spread)
+                log_info(f"{sym} H4 closed -> {t_h4} | alive={len(alive)} | spread={spread}")
+
+                # 2.1) reconcile: سفارش‌های اضافی را کنسل کن
+                reconcile_orders_with_candidates(sym, alive)
+
+                # 2.2) سفارش‌های جدید تا سقف
+                my_orders = [o for o in pending_orders(sym) if int(o.magic) == int(MAGIC)]
+                free_slots = max(0, MAX_ORDERS_PER_SYMBOL - len(my_orders))
+
+                # اگر همین حالا سفارش همان zone_id وجود دارد، دوباره نگذار
+                existing_zoneids = set([str(o.comment).strip() for o in my_orders if o.comment])
+
+                for p in alive:
+                    if free_slots <= 0:
+                        break
+                    zid = p["zone_id"]
+                    if zid in existing_zoneids:
+                        continue
+
+                    vol = calc_volume_by_risk(sym, p["price"], p["sl"], RISK_PER_TRADE, RESERVE)
+                    log_info(f"{sym} PLACE {p['direction']} | zone={zid} | price={p['price']} sl={p['sl']} tp={p['tp']} | vol={vol}")
+
+                    place_limit(sym, p["direction"], vol, p["price"], p["sl"], p["tp"], comment=zid)
+
+                    existing_zoneids.add(zid)
+                    free_slots -= 1
+
+            time.sleep(POLL_SEC)
+
+    finally:
+        shutdown()
+
+
+if __name__ == "__main__":
+    main()
