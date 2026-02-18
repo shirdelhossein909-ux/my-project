@@ -4,6 +4,7 @@ import json
 import os
 import math
 import logging
+from datetime import datetime, timedelta
 
 import pandas as pd
 import MetaTrader5 as mt5
@@ -29,7 +30,7 @@ SL_OFF = 0.25
 RESERVE = 0.15
 RISK_PER_TRADE = 0.01
 
-DRY_RUN = True     # اول True؛ بعد از تست False کن
+DRY_RUN = False
 STATE_FILE = "live_state.json"
 MT5_TERMINAL_PATH = None
 
@@ -43,7 +44,59 @@ W1_BARS = 400
 
 
 # ================== لاگ ==================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+LOG_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "log")
+USER_LOG_FILE = "live_user.log"
+AGENT_LOG_FILE = "live_agent.log"
+
+
+def ensure_agent_log_rotation(log_dir, agent_filename):
+    os.makedirs(log_dir, exist_ok=True)
+    agent_path = os.path.join(log_dir, agent_filename)
+
+    if not os.path.exists(agent_path):
+        return
+
+    modified_dt = datetime.fromtimestamp(os.path.getmtime(agent_path))
+    age = datetime.now() - modified_dt
+    if age < timedelta(days=3):
+        return
+
+    start_dt = modified_dt
+    end_dt = modified_dt + timedelta(days=2)
+    archived_name = f"{start_dt.day}-{start_dt.month}-{start_dt.year}تا{end_dt.day}-{end_dt.month}-{end_dt.year}.log"
+    archived_path = os.path.join(log_dir, archived_name)
+
+    if os.path.exists(archived_path):
+        suffix = datetime.now().strftime("_%H%M%S")
+        archived_path = archived_path.replace(".log", f"{suffix}.log")
+
+    os.rename(agent_path, archived_path)
+
+
+def setup_logging():
+    ensure_agent_log_rotation(LOG_DIR, AGENT_LOG_FILE)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    user_file_handler = logging.FileHandler(os.path.join(LOG_DIR, USER_LOG_FILE), encoding="utf-8")
+    user_file_handler.setFormatter(formatter)
+
+    agent_file_handler = logging.FileHandler(os.path.join(LOG_DIR, AGENT_LOG_FILE), encoding="utf-8")
+    agent_file_handler.setFormatter(formatter)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(user_file_handler)
+    logger.addHandler(agent_file_handler)
+
+
+setup_logging()
 
 def log_info(msg): logging.info(msg)
 def log_warn(msg): logging.warning(msg)
@@ -189,7 +242,7 @@ def calc_volume_by_risk(symbol, entry_price, sl_price, risk_pct, reserve_pct):
 def place_limit(symbol, direction, volume, entry_price, sl_price, tp_price, comment):
     otype = mt5.ORDER_TYPE_BUY_LIMIT if direction == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
 
-    req = {
+    base_req = {
         "action": mt5.TRADE_ACTION_PENDING,
         "symbol": symbol,
         "volume": float(volume),
@@ -201,15 +254,35 @@ def place_limit(symbol, direction, volume, entry_price, sl_price, tp_price, comm
         "magic": int(MAGIC),
         "comment": str(comment),
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_RETURN,
     }
 
     if DRY_RUN:
-        log_info(f"DRY_RUN place -> {req}")
+        dry_req = dict(base_req)
+        dry_req["type_filling"] = mt5.ORDER_FILLING_RETURN
+        log_info(f"DRY_RUN place -> {dry_req}")
         return None
 
-    res = mt5.order_send(req)
-    log_info(f"place result -> {res}")
+    fill_policies = [mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK]
+    for fill_type in fill_policies:
+        req = dict(base_req)
+        req["type_filling"] = fill_type
+
+        res = mt5.order_send(req)
+        log_info(f"place result -> fill={fill_type} | {res}")
+
+        if res is None:
+            code, msg = mt5.last_error()
+            log_warn(f"order_send returned None | fill={fill_type} | code={code} msg={msg}")
+            continue
+
+        if int(getattr(res, "retcode", 0)) == mt5.TRADE_RETCODE_DONE:
+            return res
+
+        if int(getattr(res, "retcode", 0)) != mt5.TRADE_RETCODE_INVALID_FILL:
+            return res
+
+        log_warn(f"invalid filling mode for {symbol}, retrying with next policy")
+
     return res
 
 
