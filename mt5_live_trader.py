@@ -4,6 +4,7 @@ import json
 import os
 import math
 import logging
+from datetime import datetime, timedelta
 
 import pandas as pd
 import MetaTrader5 as mt5
@@ -23,13 +24,15 @@ POLL_SEC = 5
 
 MAX_ORDERS_PER_SYMBOL = 3
 MAX_OPEN_POS = 3
+MAX_TOTAL_TRADES = 3
 
 ENTRY_OFF = 0.10
 SL_OFF = 0.25
 RESERVE = 0.15
 RISK_PER_TRADE = 0.01
+MAX_TOTAL_RISK = 0.03
 
-DRY_RUN = True     # اول True؛ بعد از تست False کن
+DRY_RUN = False
 STATE_FILE = "live_state.json"
 MT5_TERMINAL_PATH = None
 
@@ -43,7 +46,60 @@ W1_BARS = 400
 
 
 # ================== لاگ ==================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+LOG_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "log")
+USER_LOG_FILE = "live_user.log"
+AGENT_LOG_FILE = "live_agent.log"
+SYMBOL_RESOLVE_CACHE = {}
+
+
+def ensure_agent_log_rotation(log_dir, agent_filename):
+    os.makedirs(log_dir, exist_ok=True)
+    agent_path = os.path.join(log_dir, agent_filename)
+
+    if not os.path.exists(agent_path):
+        return
+
+    modified_dt = datetime.fromtimestamp(os.path.getmtime(agent_path))
+    age = datetime.now() - modified_dt
+    if age < timedelta(days=3):
+        return
+
+    start_dt = modified_dt
+    end_dt = modified_dt + timedelta(days=2)
+    archived_name = f"{start_dt.day}-{start_dt.month}-{start_dt.year}تا{end_dt.day}-{end_dt.month}-{end_dt.year}.log"
+    archived_path = os.path.join(log_dir, archived_name)
+
+    if os.path.exists(archived_path):
+        suffix = datetime.now().strftime("_%H%M%S")
+        archived_path = archived_path.replace(".log", f"{suffix}.log")
+
+    os.rename(agent_path, archived_path)
+
+
+def setup_logging():
+    ensure_agent_log_rotation(LOG_DIR, AGENT_LOG_FILE)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    user_file_handler = logging.FileHandler(os.path.join(LOG_DIR, USER_LOG_FILE), encoding="utf-8")
+    user_file_handler.setFormatter(formatter)
+
+    agent_file_handler = logging.FileHandler(os.path.join(LOG_DIR, AGENT_LOG_FILE), encoding="utf-8")
+    agent_file_handler.setFormatter(formatter)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(user_file_handler)
+    logger.addHandler(agent_file_handler)
+
+
+setup_logging()
 
 def log_info(msg): logging.info(msg)
 def log_warn(msg): logging.warning(msg)
@@ -99,33 +155,94 @@ def rates_to_df(rates):
     df["time"] = pd.to_datetime(df["time"], unit="s")
     return df[["time", "open", "high", "low", "close"]].copy()
 
+
+def resolve_symbol(requested_symbol):
+    cached = SYMBOL_RESOLVE_CACHE.get(requested_symbol)
+    if cached:
+        info = mt5.symbol_info(cached)
+        if info is not None:
+            return cached
+
+    info = mt5.symbol_info(requested_symbol)
+    if info is not None:
+        SYMBOL_RESOLVE_CACHE[requested_symbol] = requested_symbol
+        return requested_symbol
+
+    all_symbols = mt5.symbols_get()
+    if not all_symbols:
+        return None
+
+    base = str(requested_symbol).upper()
+    names = [s.name for s in all_symbols if getattr(s, "name", None)]
+
+    exact = [n for n in names if n.upper() == base]
+    starts = [n for n in names if n.upper().startswith(base)]
+    contains = [n for n in names if base in n.upper()]
+    candidates = exact + starts + contains
+
+    # اولویت: نماد قابل معامله
+    for name in candidates:
+        inf = mt5.symbol_info(name)
+        if inf is None:
+            continue
+        if (inf.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED):
+            SYMBOL_RESOLVE_CACHE[requested_symbol] = name
+            if name != requested_symbol:
+                log_info(f"symbol mapped: {requested_symbol} -> {name}")
+            return name
+
+    # اگر نماد قابل معامله پیدا نشد، همان اولین کاندید را بده برای لاگ دقیق‌تر
+    if candidates:
+        chosen = candidates[0]
+        SYMBOL_RESOLVE_CACHE[requested_symbol] = chosen
+        if chosen != requested_symbol:
+            log_warn(f"symbol mapped (possibly not tradable): {requested_symbol} -> {chosen}")
+        return chosen
+
+    return None
+
 def ensure_symbol(symbol):
-    info = mt5.symbol_info(symbol)
+    real_symbol = resolve_symbol(symbol)
+    if real_symbol is None:
+        code, msg = mt5.last_error()
+        log_warn(f"{symbol} symbol not found in terminal | code={code} msg={msg}")
+        return None
+
+    info = mt5.symbol_info(real_symbol)
     if info is None:
         code, msg = mt5.last_error()
-        log_warn(f"{symbol} symbol_info=None | code={code} msg={msg}")
-        return False
+        log_warn(f"{symbol} symbol_info=None (resolved={real_symbol}) | code={code} msg={msg}")
+        return None
 
     if not info.visible:
-        if not mt5.symbol_select(symbol, True):
+        if not mt5.symbol_select(real_symbol, True):
             code, msg = mt5.last_error()
-            log_warn(f"{symbol} symbol_select failed | code={code} msg={msg}")
-            return False
+            log_warn(f"{symbol} symbol_select failed (resolved={real_symbol}) | code={code} msg={msg}")
+            return None
+
+        info = mt5.symbol_info(real_symbol)
+        if info is None:
+            log_warn(f"{symbol} symbol_info became None after select (resolved={real_symbol})")
+            return None
 
     if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
-        log_warn(f"{symbol} trade_mode=DISABLED")
-        return False
+        log_warn(f"{symbol} trade_mode=DISABLED (resolved={real_symbol})")
+        return None
 
-    return True
+    return real_symbol
 
 def get_closed_bars(symbol, timeframe, n):
-    if not ensure_symbol(symbol):
+    real_symbol = ensure_symbol(symbol)
+    if not real_symbol:
         return pd.DataFrame()
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, int(n))  # pos=1 => کندل بسته
+    rates = mt5.copy_rates_from_pos(real_symbol, timeframe, 1, int(n))  # pos=1 => کندل بسته
     return rates_to_df(rates)
 
 def get_spread_now(symbol):
-    tick = mt5.symbol_info_tick(symbol)
+    real_symbol = ensure_symbol(symbol)
+    if not real_symbol:
+        return None
+    tick = mt5.symbol_info_tick(real_symbol)
     if tick is None:
         return None
     return float(tick.ask - tick.bid)
@@ -137,12 +254,66 @@ def get_last_closed_time(symbol, timeframe):
     return pd.to_datetime(df["time"].iloc[-1])
 
 def pending_orders(symbol):
-    od = mt5.orders_get(symbol=symbol)
+    real_symbol = resolve_symbol(symbol) or symbol
+    od = mt5.orders_get(symbol=real_symbol)
     return list(od) if od else []
 
 def positions(symbol=None):
-    ps = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    real_symbol = (resolve_symbol(symbol) or symbol) if symbol else None
+    ps = mt5.positions_get(symbol=real_symbol) if real_symbol else mt5.positions_get()
     return list(ps) if ps else []
+
+
+def _risk_money_for_setup(symbol, direction, volume, entry_price, sl_price):
+    real_symbol = resolve_symbol(symbol) or symbol
+    order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+    pnl = mt5.order_calc_profit(order_type, real_symbol, float(volume), float(entry_price), float(sl_price))
+    if pnl is None:
+        info = mt5.symbol_info(real_symbol)
+        if info is None:
+            return 0.0
+        tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+        tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+        if tick_value <= 0.0 or tick_size <= 0.0:
+            return 0.0
+        ticks = abs(float(entry_price) - float(sl_price)) / tick_size
+        return abs(ticks * tick_value * float(volume))
+    return abs(float(pnl))
+
+
+def account_total_risk_money():
+    total = 0.0
+
+    for p in positions():
+        sl = float(getattr(p, "sl", 0.0) or 0.0)
+        if sl <= 0.0:
+            continue
+        direction = "BUY" if int(p.type) == int(mt5.POSITION_TYPE_BUY) else "SELL"
+        total += _risk_money_for_setup(p.symbol, direction, float(p.volume), float(p.price_open), sl)
+
+    all_orders = mt5.orders_get()
+    if all_orders:
+        for o in all_orders:
+            if o.type not in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT):
+                continue
+            sl = float(getattr(o, "sl", 0.0) or 0.0)
+            if sl <= 0.0:
+                continue
+            direction = "BUY" if int(o.type) == int(mt5.ORDER_TYPE_BUY_LIMIT) else "SELL"
+            total += _risk_money_for_setup(o.symbol, direction, float(o.volume_current), float(o.price_open), sl)
+
+    return float(total)
+
+
+def total_open_trades_count():
+    all_orders = mt5.orders_get()
+    pending_count = 0
+    if all_orders:
+        pending_count = len([
+            o for o in all_orders
+            if o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT)
+        ])
+    return len(positions()) + pending_count
 
 
 # ================== ترید/کنسل ==================
@@ -157,7 +328,8 @@ def cancel_order(ticket):
 
 def calc_volume_by_risk(symbol, entry_price, sl_price, risk_pct, reserve_pct):
     acc = mt5.account_info()
-    info = mt5.symbol_info(symbol)
+    real_symbol = resolve_symbol(symbol) or symbol
+    info = mt5.symbol_info(real_symbol)
     if acc is None or info is None:
         return 0.01
 
@@ -187,11 +359,16 @@ def calc_volume_by_risk(symbol, entry_price, sl_price, risk_pct, reserve_pct):
     return round(float(vol), 6)
 
 def place_limit(symbol, direction, volume, entry_price, sl_price, tp_price, comment):
+    real_symbol = ensure_symbol(symbol)
+    if not real_symbol:
+        log_warn(f"{symbol} place skipped: symbol not tradable")
+        return None
+
     otype = mt5.ORDER_TYPE_BUY_LIMIT if direction == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
 
-    req = {
+    base_req = {
         "action": mt5.TRADE_ACTION_PENDING,
-        "symbol": symbol,
+        "symbol": real_symbol,
         "volume": float(volume),
         "type": int(otype),
         "price": float(entry_price),
@@ -201,15 +378,35 @@ def place_limit(symbol, direction, volume, entry_price, sl_price, tp_price, comm
         "magic": int(MAGIC),
         "comment": str(comment),
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_RETURN,
     }
 
     if DRY_RUN:
-        log_info(f"DRY_RUN place -> {req}")
+        dry_req = dict(base_req)
+        dry_req["type_filling"] = mt5.ORDER_FILLING_RETURN
+        log_info(f"DRY_RUN place -> {dry_req}")
         return None
 
-    res = mt5.order_send(req)
-    log_info(f"place result -> {res}")
+    fill_policies = [mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK]
+    for fill_type in fill_policies:
+        req = dict(base_req)
+        req["type_filling"] = fill_type
+
+        res = mt5.order_send(req)
+        log_info(f"place result -> fill={fill_type} | {res}")
+
+        if res is None:
+            code, msg = mt5.last_error()
+            log_warn(f"order_send returned None | fill={fill_type} | code={code} msg={msg}")
+            continue
+
+        if int(getattr(res, "retcode", 0)) == mt5.TRADE_RETCODE_DONE:
+            return res
+
+        if int(getattr(res, "retcode", 0)) != mt5.TRADE_RETCODE_INVALID_FILL:
+            return res
+
+        log_warn(f"invalid filling mode for {symbol}, retrying with next policy")
+
     return res
 
 
@@ -402,7 +599,8 @@ def find_active_pending_candidates(symbol, spread):
 
 # ================== کنسل RR4 روی سفارش‌های واقعی ==================
 def manage_cancel_rr4(symbol):
-    tick = mt5.symbol_info_tick(symbol)
+    real_symbol = resolve_symbol(symbol) or symbol
+    tick = mt5.symbol_info_tick(real_symbol)
     if tick is None:
         return
 
@@ -490,6 +688,10 @@ def main():
                     log_info(f"{sym} skip: max open positions reached")
                     continue
 
+                if total_open_trades_count() >= MAX_TOTAL_TRADES:
+                    log_info(f"{sym} skip: max total trades reached ({MAX_TOTAL_TRADES})")
+                    continue
+
                 spread = get_spread_now(sym)
                 if spread is None:
                     log_warn(f"{sym} skip: no spread/tick")
@@ -511,11 +713,30 @@ def main():
                 for p in alive:
                     if free_slots <= 0:
                         break
+
+                    if total_open_trades_count() >= MAX_TOTAL_TRADES:
+                        log_info(f"{sym} skip place: reached max total trades ({MAX_TOTAL_TRADES})")
+                        break
+
                     zid = p["zone_id"]
                     if zid in existing_zoneids:
                         continue
 
                     vol = calc_volume_by_risk(sym, p["price"], p["sl"], RISK_PER_TRADE, RESERVE)
+
+                    next_risk = _risk_money_for_setup(sym, p["direction"], vol, p["price"], p["sl"])
+                    acc = mt5.account_info()
+                    equity = float(acc.equity) if acc else 0.0
+                    max_allowed_risk = max(0.0, equity * MAX_TOTAL_RISK)
+                    current_risk = account_total_risk_money()
+
+                    if (current_risk + next_risk) > max_allowed_risk:
+                        log_warn(
+                            f"{sym} skip place: risk cap reached | current={current_risk:.2f} "
+                            f"next={next_risk:.2f} cap={max_allowed_risk:.2f}"
+                        )
+                        continue
+
                     log_info(f"{sym} PLACE {p['direction']} | zone={zid} | price={p['price']} sl={p['sl']} tp={p['tp']} | vol={vol}")
 
                     place_limit(sym, p["direction"], vol, p["price"], p["sl"], p["tp"], comment=zid)
