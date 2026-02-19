@@ -6,31 +6,71 @@ import pandas as pd
 
 # (خروجی PDF/ژورنال در نسخه 1.9 تولید نمی‌شود)
 # این وابستگی‌ها اختیاری هستند؛ اگر نصب نبودند، بک‌تست همچنان اجرا می‌شود.
+canvas = None
+A4 = (595.27, 841.89)
+pdfmetrics = None
+TTFont = None
+arabic_reshaper = None
+
+
+def get_display(x):  # type: ignore
+    return x
+
+
 try:
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+except ImportError:
+    pass
+
+try:
     import arabic_reshaper
-    from bidi.algorithm import get_display
-except Exception:
-    canvas = None
-    A4 = (595.27, 841.89)
-    pdfmetrics = None
-    TTFont = None
+except ImportError:
     arabic_reshaper = None
-    def get_display(x):  # type: ignore
-        return x
+
+try:
+    from bidi.algorithm import get_display as _bidi_get_display
+    get_display = _bidi_get_display  # type: ignore
+except ImportError:
+    pass
 # ---------------- Persian helpers ----------------
 def fa(s: str) -> str:
     s = str(s)
     if arabic_reshaper is None:
         return s
     return get_display(arabic_reshaper.reshape(s))
+def _find_fa_font_path():
+    candidates = [
+        r"C:\Windows\Fonts\tahoma.ttf",
+        r"C:\Windows\Fonts\Tahoma.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+
+    for fp in candidates:
+        if os.path.exists(fp):
+            return fp
+
+    local_fonts = glob.glob(os.path.join(os.getcwd(), "fonts", "*.ttf"))
+    if local_fonts:
+        return local_fonts[0]
+
+    return None
+
+
 def register_fa_font():
-    font_path = r"C:\Windows\Fonts\tahoma.ttf"
-    if not os.path.exists(font_path):
-        raise RuntimeError("فونت tahoma.ttf پیدا نشد.")
+    if pdfmetrics is None or TTFont is None:
+        raise RuntimeError("کتابخانه reportlab نصب نیست.")
+
+    font_path = _find_fa_font_path()
+    if not font_path:
+        raise RuntimeError("فونت مناسب فارسی پیدا نشد (tahoma/dejavu/arial یا fonts/*.ttf).")
+
     pdfmetrics.registerFont(TTFont("FA", font_path))
     return "FA"
 
@@ -50,6 +90,9 @@ def wrap_text(s: str, max_chars=80):
 
 # ------------- CSV reader (MetaTrader no header) -------------
 def read_mt_csv_from_bytes(b: bytes) -> pd.DataFrame:
+    if b is None or len(b) == 0:
+        raise ValueError("فایل CSV خالی است.")
+
     df = pd.read_csv(io.BytesIO(b), header=None)
     # Date, Time, Open, High, Low, Close, Volume
     if df.shape[1] < 6:
@@ -70,14 +113,38 @@ def read_mt_csv_from_bytes(b: bytes) -> pd.DataFrame:
     return df
 
 def load_timeframes_from_zip(zip_path: str):
+    if not os.path.exists(zip_path):
+        raise FileNotFoundError(f"فایل ZIP پیدا نشد: {zip_path}")
+
     with zipfile.ZipFile(zip_path, "r") as z:
         names = z.namelist()
-        f240 = [n for n in names if n.endswith("-240.csv")][0]
-        f1d  = [n for n in names if n.endswith("-1D.csv")][0]
-        f1w  = [n for n in names if n.endswith("-1W.csv")][0]
+        if not names:
+            raise ValueError(f"فایل ZIP خالی است: {zip_path}")
+
+        f240_list = [n for n in names if n.endswith("-240.csv")]
+        f1d_list  = [n for n in names if n.endswith("-1D.csv")]
+        f1w_list  = [n for n in names if n.endswith("-1W.csv")]
+
+        if not f240_list or not f1d_list or not f1w_list:
+            raise ValueError(
+                f"داخل ZIP فایل‌های لازم پیدا نشد: {zip_path} | "
+                f"240={len(f240_list)} 1D={len(f1d_list)} 1W={len(f1w_list)}"
+            )
+
+        f240 = f240_list[0]
+        f1d = f1d_list[0]
+        f1w = f1w_list[0]
+
         h4 = read_mt_csv_from_bytes(z.read(f240))
         d1 = read_mt_csv_from_bytes(z.read(f1d))
         w1 = read_mt_csv_from_bytes(z.read(f1w))
+
+    if h4.empty or d1.empty or w1.empty:
+        raise ValueError(
+            f"داده‌ی یکی از تایم‌فریم‌ها داخل ZIP خالی است: {zip_path} | "
+            f"h4={len(h4)} d1={len(d1)} w1={len(w1)}"
+        )
+
     return h4, d1, w1
 
 # ---------------- Indicators ----------------
