@@ -24,11 +24,13 @@ POLL_SEC = 5
 
 MAX_ORDERS_PER_SYMBOL = 3
 MAX_OPEN_POS = 3
+MAX_TOTAL_TRADES = 3
 
 ENTRY_OFF = 0.10
 SL_OFF = 0.25
 RESERVE = 0.15
 RISK_PER_TRADE = 0.01
+MAX_TOTAL_RISK = 0.03
 
 DRY_RUN = False
 STATE_FILE = "live_state.json"
@@ -260,6 +262,58 @@ def positions(symbol=None):
     real_symbol = (resolve_symbol(symbol) or symbol) if symbol else None
     ps = mt5.positions_get(symbol=real_symbol) if real_symbol else mt5.positions_get()
     return list(ps) if ps else []
+
+
+def _risk_money_for_setup(symbol, direction, volume, entry_price, sl_price):
+    real_symbol = resolve_symbol(symbol) or symbol
+    order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+    pnl = mt5.order_calc_profit(order_type, real_symbol, float(volume), float(entry_price), float(sl_price))
+    if pnl is None:
+        info = mt5.symbol_info(real_symbol)
+        if info is None:
+            return 0.0
+        tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+        tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+        if tick_value <= 0.0 or tick_size <= 0.0:
+            return 0.0
+        ticks = abs(float(entry_price) - float(sl_price)) / tick_size
+        return abs(ticks * tick_value * float(volume))
+    return abs(float(pnl))
+
+
+def account_total_risk_money():
+    total = 0.0
+
+    for p in positions():
+        sl = float(getattr(p, "sl", 0.0) or 0.0)
+        if sl <= 0.0:
+            continue
+        direction = "BUY" if int(p.type) == int(mt5.POSITION_TYPE_BUY) else "SELL"
+        total += _risk_money_for_setup(p.symbol, direction, float(p.volume), float(p.price_open), sl)
+
+    all_orders = mt5.orders_get()
+    if all_orders:
+        for o in all_orders:
+            if o.type not in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT):
+                continue
+            sl = float(getattr(o, "sl", 0.0) or 0.0)
+            if sl <= 0.0:
+                continue
+            direction = "BUY" if int(o.type) == int(mt5.ORDER_TYPE_BUY_LIMIT) else "SELL"
+            total += _risk_money_for_setup(o.symbol, direction, float(o.volume_current), float(o.price_open), sl)
+
+    return float(total)
+
+
+def total_open_trades_count():
+    all_orders = mt5.orders_get()
+    pending_count = 0
+    if all_orders:
+        pending_count = len([
+            o for o in all_orders
+            if o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT)
+        ])
+    return len(positions()) + pending_count
 
 
 # ================== ترید/کنسل ==================
@@ -634,6 +688,10 @@ def main():
                     log_info(f"{sym} skip: max open positions reached")
                     continue
 
+                if total_open_trades_count() >= MAX_TOTAL_TRADES:
+                    log_info(f"{sym} skip: max total trades reached ({MAX_TOTAL_TRADES})")
+                    continue
+
                 spread = get_spread_now(sym)
                 if spread is None:
                     log_warn(f"{sym} skip: no spread/tick")
@@ -655,11 +713,30 @@ def main():
                 for p in alive:
                     if free_slots <= 0:
                         break
+
+                    if total_open_trades_count() >= MAX_TOTAL_TRADES:
+                        log_info(f"{sym} skip place: reached max total trades ({MAX_TOTAL_TRADES})")
+                        break
+
                     zid = p["zone_id"]
                     if zid in existing_zoneids:
                         continue
 
                     vol = calc_volume_by_risk(sym, p["price"], p["sl"], RISK_PER_TRADE, RESERVE)
+
+                    next_risk = _risk_money_for_setup(sym, p["direction"], vol, p["price"], p["sl"])
+                    acc = mt5.account_info()
+                    equity = float(acc.equity) if acc else 0.0
+                    max_allowed_risk = max(0.0, equity * MAX_TOTAL_RISK)
+                    current_risk = account_total_risk_money()
+
+                    if (current_risk + next_risk) > max_allowed_risk:
+                        log_warn(
+                            f"{sym} skip place: risk cap reached | current={current_risk:.2f} "
+                            f"next={next_risk:.2f} cap={max_allowed_risk:.2f}"
+                        )
+                        continue
+
                     log_info(f"{sym} PLACE {p['direction']} | zone={zid} | price={p['price']} sl={p['sl']} tp={p['tp']} | vol={vol}")
 
                     place_limit(sym, p["direction"], vol, p["price"], p["sl"], p["tp"], comment=zid)
