@@ -47,6 +47,7 @@ W1_BARS = 400
 LOG_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "log")
 USER_LOG_FILE = "live_user.log"
 AGENT_LOG_FILE = "live_agent.log"
+SYMBOL_RESOLVE_CACHE = {}
 
 
 def ensure_agent_log_rotation(log_dir, agent_filename):
@@ -152,33 +153,94 @@ def rates_to_df(rates):
     df["time"] = pd.to_datetime(df["time"], unit="s")
     return df[["time", "open", "high", "low", "close"]].copy()
 
+
+def resolve_symbol(requested_symbol):
+    cached = SYMBOL_RESOLVE_CACHE.get(requested_symbol)
+    if cached:
+        info = mt5.symbol_info(cached)
+        if info is not None:
+            return cached
+
+    info = mt5.symbol_info(requested_symbol)
+    if info is not None:
+        SYMBOL_RESOLVE_CACHE[requested_symbol] = requested_symbol
+        return requested_symbol
+
+    all_symbols = mt5.symbols_get()
+    if not all_symbols:
+        return None
+
+    base = str(requested_symbol).upper()
+    names = [s.name for s in all_symbols if getattr(s, "name", None)]
+
+    exact = [n for n in names if n.upper() == base]
+    starts = [n for n in names if n.upper().startswith(base)]
+    contains = [n for n in names if base in n.upper()]
+    candidates = exact + starts + contains
+
+    # اولویت: نماد قابل معامله
+    for name in candidates:
+        inf = mt5.symbol_info(name)
+        if inf is None:
+            continue
+        if (inf.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED):
+            SYMBOL_RESOLVE_CACHE[requested_symbol] = name
+            if name != requested_symbol:
+                log_info(f"symbol mapped: {requested_symbol} -> {name}")
+            return name
+
+    # اگر نماد قابل معامله پیدا نشد، همان اولین کاندید را بده برای لاگ دقیق‌تر
+    if candidates:
+        chosen = candidates[0]
+        SYMBOL_RESOLVE_CACHE[requested_symbol] = chosen
+        if chosen != requested_symbol:
+            log_warn(f"symbol mapped (possibly not tradable): {requested_symbol} -> {chosen}")
+        return chosen
+
+    return None
+
 def ensure_symbol(symbol):
-    info = mt5.symbol_info(symbol)
+    real_symbol = resolve_symbol(symbol)
+    if real_symbol is None:
+        code, msg = mt5.last_error()
+        log_warn(f"{symbol} symbol not found in terminal | code={code} msg={msg}")
+        return None
+
+    info = mt5.symbol_info(real_symbol)
     if info is None:
         code, msg = mt5.last_error()
-        log_warn(f"{symbol} symbol_info=None | code={code} msg={msg}")
-        return False
+        log_warn(f"{symbol} symbol_info=None (resolved={real_symbol}) | code={code} msg={msg}")
+        return None
 
     if not info.visible:
-        if not mt5.symbol_select(symbol, True):
+        if not mt5.symbol_select(real_symbol, True):
             code, msg = mt5.last_error()
-            log_warn(f"{symbol} symbol_select failed | code={code} msg={msg}")
-            return False
+            log_warn(f"{symbol} symbol_select failed (resolved={real_symbol}) | code={code} msg={msg}")
+            return None
+
+        info = mt5.symbol_info(real_symbol)
+        if info is None:
+            log_warn(f"{symbol} symbol_info became None after select (resolved={real_symbol})")
+            return None
 
     if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
-        log_warn(f"{symbol} trade_mode=DISABLED")
-        return False
+        log_warn(f"{symbol} trade_mode=DISABLED (resolved={real_symbol})")
+        return None
 
-    return True
+    return real_symbol
 
 def get_closed_bars(symbol, timeframe, n):
-    if not ensure_symbol(symbol):
+    real_symbol = ensure_symbol(symbol)
+    if not real_symbol:
         return pd.DataFrame()
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, int(n))  # pos=1 => کندل بسته
+    rates = mt5.copy_rates_from_pos(real_symbol, timeframe, 1, int(n))  # pos=1 => کندل بسته
     return rates_to_df(rates)
 
 def get_spread_now(symbol):
-    tick = mt5.symbol_info_tick(symbol)
+    real_symbol = ensure_symbol(symbol)
+    if not real_symbol:
+        return None
+    tick = mt5.symbol_info_tick(real_symbol)
     if tick is None:
         return None
     return float(tick.ask - tick.bid)
@@ -190,11 +252,13 @@ def get_last_closed_time(symbol, timeframe):
     return pd.to_datetime(df["time"].iloc[-1])
 
 def pending_orders(symbol):
-    od = mt5.orders_get(symbol=symbol)
+    real_symbol = resolve_symbol(symbol) or symbol
+    od = mt5.orders_get(symbol=real_symbol)
     return list(od) if od else []
 
 def positions(symbol=None):
-    ps = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    real_symbol = (resolve_symbol(symbol) or symbol) if symbol else None
+    ps = mt5.positions_get(symbol=real_symbol) if real_symbol else mt5.positions_get()
     return list(ps) if ps else []
 
 
@@ -210,7 +274,8 @@ def cancel_order(ticket):
 
 def calc_volume_by_risk(symbol, entry_price, sl_price, risk_pct, reserve_pct):
     acc = mt5.account_info()
-    info = mt5.symbol_info(symbol)
+    real_symbol = resolve_symbol(symbol) or symbol
+    info = mt5.symbol_info(real_symbol)
     if acc is None or info is None:
         return 0.01
 
@@ -240,11 +305,16 @@ def calc_volume_by_risk(symbol, entry_price, sl_price, risk_pct, reserve_pct):
     return round(float(vol), 6)
 
 def place_limit(symbol, direction, volume, entry_price, sl_price, tp_price, comment):
+    real_symbol = ensure_symbol(symbol)
+    if not real_symbol:
+        log_warn(f"{symbol} place skipped: symbol not tradable")
+        return None
+
     otype = mt5.ORDER_TYPE_BUY_LIMIT if direction == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
 
     base_req = {
         "action": mt5.TRADE_ACTION_PENDING,
-        "symbol": symbol,
+        "symbol": real_symbol,
         "volume": float(volume),
         "type": int(otype),
         "price": float(entry_price),
@@ -475,7 +545,8 @@ def find_active_pending_candidates(symbol, spread):
 
 # ================== کنسل RR4 روی سفارش‌های واقعی ==================
 def manage_cancel_rr4(symbol):
-    tick = mt5.symbol_info_tick(symbol)
+    real_symbol = resolve_symbol(symbol) or symbol
+    tick = mt5.symbol_info_tick(real_symbol)
     if tick is None:
         return
 
